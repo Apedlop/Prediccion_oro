@@ -1,0 +1,7 @@
+pandas 
+yfinance 
+pymongo 
+boto3 
+pyarrow 
+python-dotenv
+confluent-kafka
