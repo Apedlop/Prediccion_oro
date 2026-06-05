@@ -47,6 +47,9 @@ import numpy as np
 from datetime import datetime, timezone
 from pymongo import MongoClient
 
+import mysql.connector
+from botocore.exceptions import ClientError
+
 # ─────────────────────────────────────────────
 # VARIABLES ENTORNO
 # ─────────────────────────────────────────────
@@ -91,6 +94,7 @@ session = boto3.session.Session(
 
 s3 = session.client("s3")
 glue = session.client("glue")
+rds = session.client("rds")
 
 # ─────────────────────────────────────────────
 # KAFKA PRODUCER
@@ -292,101 +296,118 @@ def run_consumer():
         consumer.close()
 
 # ─────────────────────────────────────────────
-# GLUE CRAWLER
+# AWS RDS
 # ─────────────────────────────────────────────
-def run_glue_crawler():
 
-    print("\n[Glue] Ejecutando crawler...")
-
+def create_rds_instance():
     try:
-        glue.start_crawler(Name=GLUE_CRAWLER)
-        print("[Glue] Crawler iniciado")
-
-    except Exception as e:
-        print(f"[Glue] Error crawler: {e}")
-
-
-# ─────────────────────────────────────────────
-# GLUE JOB + WAIT
-# ─────────────────────────────────────────────
-def wait_for_glue_job(job_run_id):
-
-    print("\n[Glue] Esperando finalización...")
-
-    while True:
-
-        response = glue.get_job_run(
-            JobName=GLUE_JOB,
-            RunId=job_run_id
+        print("Comprobando si la instancia RDS ya existe...")
+        info = rds.describe_db_instances(
+            DBInstanceIdentifier=os.getenv("DB_INSTANCE_ID")
         )
+        print("Instancia encontrada.")
+    except ClientError as e:
+        if "DBInstanceNotFound" in str(e):
+            print("Creando instancia RDS...")
 
-        status = response["JobRun"]["JobRunState"]
+            rds.create_db_instance(
+                DBInstanceIdentifier=os.getenv("DB_INSTANCE_ID"),
+                AllocatedStorage=20,
+                DBInstanceClass="db.t4g.micro",
+                Engine="mariadb",
+                MasterUsername=os.getenv("DB_USER"),
+                MasterUserPassword=os.getenv("DB_PASSWORD"),
+                DBName=os.getenv("DB_NAME"),
+                PubliclyAccessible=True
+            )
+        else:
+            raise e
 
-        print("[Glue] Estado:", status)
+    waiter = rds.get_waiter('db_instance_available')
+    waiter.wait(DBInstanceIdentifier=os.getenv("DB_INSTANCE_ID"))
 
-        if status == "SUCCEEDED":
-            print("[Glue] ETL OK")
-            break
+    info = rds.describe_db_instances(
+        DBInstanceIdentifier=os.getenv("DB_INSTANCE_ID")
+    )
 
-        if status in ["FAILED", "STOPPED", "TIMEOUT"]:
-            raise Exception(f"Glue falló: {status}")
+    endpoint = info['DBInstances'][0]['Endpoint']['Address']
 
-        time.sleep(15)
+    print(f"RDS disponible en endpoint: {endpoint}")
+    return endpoint
 
+def connect_to_rds(endpoint):
+    # Ha estado dando error la conexión, asi que se ha hecho un tunel con EC2 para conectar el RDS localmente 
+    config = {
+        "user": os.getenv("DB_USER"),
+        "password": os.getenv("DB_PASSWORD"),
+        "host": "127.0.0.1",
+        "port": 3306,
+        "database": os.getenv("DB_NAME")
+    }
 
-def run_glue_job():
+    DB_NAME = os.getenv("DB_NAME")
 
-    print("\n[Glue] Ejecutando ETL Job...")
+    cnx = mysql.connector.connect(**config)
+    cursor = cnx.cursor(dictionary=True)
 
-    try:
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
+    cursor.execute(f"USE {DB_NAME}")
 
-        response = glue.start_job_run(JobName=GLUE_JOB)
-        job_run_id = response["JobRunId"]
+    print(f"Conectado a la base de datos {DB_NAME}")
 
-        print("[Glue] Job ID:", job_run_id)
+    return cnx, cursor
 
-        wait_for_glue_job(job_run_id)
-
-    except Exception as e:
-        print("[Glue] Error job:", e)
-
-
-# ─────────────────────────────────────────────
-# S3 → MONGODB
-# ─────────────────────────────────────────────
-def upload_processed_to_mongodb():
-
-    print("\n[MongoDB] Cargando datos desde S3...")
-
-    try:
-
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        collection = db[MONGO_COLLECTION]
-
-        collection.delete_many({})
-
-        prefix = "processed/gold_unified/"
-
-        response = s3.list_objects_v2(
-            Bucket=BUCKET_NAME,
-            Prefix=prefix
+def create_gold_table(cursor, cnx):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gold_prices (
+            id            INT PRIMARY KEY AUTO_INCREMENT,
+            date          VARCHAR(50),
+            open          FLOAT,
+            high          FLOAT,
+            low           FLOAT,
+            close         FLOAT,
+            volume        FLOAT,
+            source        VARCHAR(20),
+            ingested_at   VARCHAR(50)
         )
+    """)
+    cnx.commit()
+    print("[RDS] Tabla gold_prices lista")
 
-        if "Contents" not in response:
-            print("[MongoDB] No hay datos procesados")
-            return
+def drop_table(cursor, cnx):
 
-        total = 0
+    cursor.execute("""
+        DROP TABLE IF EXISTS gold_prices
+    """)
 
-        for obj in response["Contents"]:
+    cnx.commit()
 
-            key = obj["Key"]
+    print("[RDS] Tabla gold_prices eliminada")
 
-            if key.endswith("/"):
-                continue
+def ingest_s3_data():
 
-            print("[MongoDB] leyendo:", key)
+    response = s3.list_objects_v2(
+        Bucket=BUCKET_NAME,
+        Prefix="gold_csv/"
+    )
+
+    if "Contents" not in response:
+        print("[S3] No hay archivos en gold_csv/")
+        return []
+
+    records = []
+
+    for obj in response["Contents"]:
+
+        key = obj["Key"]
+
+        # Saltar carpetas
+        if key.endswith("/"):
+            continue
+
+        print(f"[S3] Procesando: {key}")
+
+        try:
 
             file_obj = s3.get_object(
                 Bucket=BUCKET_NAME,
@@ -395,25 +416,344 @@ def upload_processed_to_mongodb():
 
             content = file_obj["Body"].read().decode("utf-8")
 
-            lines = content.strip().split("\n")
+            data = json.loads(content)
 
-            docs = []
+            if "date;open;high;low;close;volume" in data:
 
-            for line in lines:
-                try:
-                    docs.append(json.loads(line))
-                except:
-                    pass
+                raw = data["date;open;high;low;close;volume"]
 
-            if docs:
-                collection.insert_many(docs)
-                total += len(docs)
+                values = raw.split(";")
 
-        print(f"[MongoDB] Insertados: {total}")
+                if len(values) != 6:
+                    print(f"[S3] Formato CSV inválido: {key}")
+                    continue
+
+                record = {
+                    "date": values[0],
+                    "open": float(values[1]),
+                    "high": float(values[2]),
+                    "low": float(values[3]),
+                    "close": float(values[4]),
+                    "volume": float(values[5]),
+                    "source": data.get("source"),
+                    "ingested_at": data.get("ingested_at")
+                }
+
+            elif "date" in data:
+
+                record = {
+                    "date": data.get("date"),
+                    "open": float(data.get("open", 0)),
+                    "high": float(data.get("high", 0)),
+                    "low": float(data.get("low", 0)),
+                    "close": float(data.get("close", 0)),
+                    "volume": float(data.get("volume", 0)),
+                    "source": data.get("source"),
+                    "ingested_at": data.get("ingested_at")
+                }
+
+            else:
+                print(f"[S3] Formato desconocido: {key}")
+                continue
+
+            records.append(record)
+
+        except Exception as e:
+            print(f"[S3] Error procesando {key}: {e}")
+
+    print(f"[S3] {len(records)} registros preparados")
+
+    return records
+
+def ingest_s3_data():
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    pages = paginator.paginate(
+        Bucket=BUCKET_NAME,
+        Prefix="gold_csv/"
+    )
+
+    records = []
+
+    total_files = 0
+
+    for page in pages:
+
+        if "Contents" not in page:
+            continue
+
+        for obj in page["Contents"]:
+
+            key = obj["Key"]
+
+            # Saltar carpetas
+            if key.endswith("/"):
+                continue
+
+            total_files += 1
+
+            print(f"[S3] Procesando: {key}")
+
+            try:
+
+                file_obj = s3.get_object(
+                    Bucket=BUCKET_NAME,
+                    Key=key
+                )
+
+                content = file_obj["Body"].read().decode("utf-8")
+
+                data = json.loads(content)
+
+                if "date;open;high;low;close;volume" in data:
+
+                    raw = data["date;open;high;low;close;volume"]
+
+                    values = raw.split(";")
+
+                    if len(values) != 6:
+                        print(f"[S3] Formato inválido: {key}")
+                        continue
+
+                    record = {
+                        "date": values[0],
+                        "open": float(values[1]),
+                        "high": float(values[2]),
+                        "low": float(values[3]),
+                        "close": float(values[4]),
+                        "volume": float(values[5]),
+                        "source": data.get("source"),
+                        "ingested_at": data.get("ingested_at")
+                    }
+
+                elif "date" in data:
+
+                    record = {
+                        "date": data.get("date"),
+                        "open": float(data.get("open", 0)),
+                        "high": float(data.get("high", 0)),
+                        "low": float(data.get("low", 0)),
+                        "close": float(data.get("close", 0)),
+                        "volume": float(data.get("volume", 0)),
+                        "source": data.get("source"),
+                        "ingested_at": data.get("ingested_at")
+                    }
+
+                else:
+                    print(f"[S3] Formato desconocido: {key}")
+                    continue
+
+                records.append(record)
+
+            except Exception as e:
+                print(f"[S3] Error procesando {key}: {e}")
+
+    print(f"\n[S3] Archivos procesados: {total_files}")
+    print(f"[S3] Registros preparados: {len(records)}")
+
+    return records
+
+def insert_data(cursor, cnx, records):
+
+    print(f"\n[RDS] Insertando {len(records)} registros...")
+
+    sql = """
+        INSERT INTO gold_prices
+        (
+            date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            source,
+            ingested_at
+        )
+        VALUES
+        (
+            %s, %s, %s, %s,
+            %s, %s, %s, %s
+        )
+    """
+
+    rows = []
+
+    for record in records:
+
+        rows.append((
+            record["date"],
+            record["open"],
+            record["high"],
+            record["low"],
+            record["close"],
+            record["volume"],
+            record["source"],
+            record["ingested_at"]
+        ))
+
+    cursor.executemany(sql, rows)
+
+    cnx.commit()
+
+    print(f"[RDS] {cursor.rowcount} filas insertadas correctamente")
+
+def csv_to_rds():
+
+    print("\n[RDS] Cargando S3 → RDS...")
+
+    try:
+
+        endpoint = create_rds_instance()
+
+        cnx, cursor = connect_to_rds(endpoint)
+
+        create_gold_table(cursor, cnx)
+
+        # INGESTA DESDE S3
+        records = ingest_s3_data()
+
+        # INSERT EN RDS
+        if records:
+            insert_data(cursor, cnx, records)
+        else:
+            print("[RDS] No hay datos para insertar")
+
+        cursor.close()
+        cnx.close()
+
+        print("[RDS] Proceso completado")
 
     except Exception as e:
-        print("[MongoDB] Error:", e)
+        print(f"[RDS] Error: {e}")
 
+# ─────────────────────────────────────────────
+# MONGODB
+# ─────────────────────────────────────────────
+
+def ingest_yfinance_to_mongo():
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    pages = paginator.paginate(
+        Bucket=BUCKET_NAME,
+        Prefix="gold_yfinance/"
+    )
+
+    records = []
+
+    total_files = 0
+
+    for page in pages:
+
+        if "Contents" not in page:
+            continue
+
+        for obj in page["Contents"]:
+
+            key = obj["Key"]
+
+            # Saltar carpetas
+            if key.endswith("/"):
+                continue
+
+            total_files += 1
+
+            print(f"[S3] Procesando: {key}")
+
+            try:
+
+                file_obj = s3.get_object(
+                    Bucket=BUCKET_NAME,
+                    Key=key
+                )
+
+                content = file_obj["Body"].read().decode("utf-8")
+
+                data = json.loads(content)
+
+                # =================================================
+                # NORMALIZAR NOMBRES DE COLUMNAS
+                # =================================================
+
+                record = {
+
+                    "date": data.get("Date"),
+
+                    "open": float(
+                        data.get("Open_GC=F") or 0
+                    ),
+
+                    "high": float(
+                        data.get("High_GC=F") or 0
+                    ),
+
+                    "low": float(
+                        data.get("Low_GC=F") or 0
+                    ),
+
+                    "close": float(
+                        data.get("Close_GC=F") or 0
+                    ),
+
+                    "volume": float(
+                        data.get("Volume_GC=F") or 0
+                    ),
+
+                    "source": data.get("source"),
+
+                    "ticker": data.get("ticker"),
+
+                    "ingested_at": data.get("ingested_at")
+                }
+
+                records.append(record)
+
+            except Exception as e:
+
+                print(f"[S3] Error procesando {key}: {e}")
+
+    print(f"\n[S3] Archivos procesados: {total_files}")
+    print(f"[S3] Registros preparados: {len(records)}")
+
+    return records
+
+
+def insert_to_mongo(records):
+
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB]
+    collection = db[MONGO_COLLECTION]
+
+    if not records:
+        print("[MONGO] No hay datos para insertar")
+        return
+
+    result = collection.insert_many(records)
+
+    print(f"[MONGO] Insertados {len(result.inserted_ids)} registros")
+
+def drop_mongo_collection():
+
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB]
+
+    db.drop_collection("gold_yfinance")
+
+    print("[MONGO] Colección gold_yfinance eliminada")
+
+def yfinance_to_mongo():
+
+    print("\n[MONGO] Iniciando ingesta S3 → MongoDB")
+
+    # drop_mongo_collection()
+
+    records = ingest_yfinance_to_mongo()
+    print(f"[DEBUG] records recibidos: {len(records)}")
+
+    insert_to_mongo(records)
+
+    print("[MONGO] Proceso completado")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -431,14 +771,20 @@ if __name__ == "__main__":
     # 2. CONSUMER -> S3
     # run_consumer()
 
+    # 3. RDS
+    #csv_to_rds()
+
+    # MONGODB
+    yfinance_to_mongo()
+
     # 3. GLUE CRAWLER
-    run_glue_crawler()
-    time.sleep(10)
+    # run_glue_crawler()
+    # time.sleep(10)
 
     # 4. GLUE ETL
-    run_glue_job()
+    # run_glue_job()
 
     # 5. S3 → MONGODB
-    upload_processed_to_mongodb()
+    # upload_processed_to_mongodb()
 
     print("\n[INFO] PIPELINE COMPLETADO")
