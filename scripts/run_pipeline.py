@@ -1,34 +1,3 @@
-"""
-MAIN PIPELINE - Proyecto Integración de Datos del Oro
-
-Arquitectura:
-CSV + yfinance
-        ↓
-Kafka Producer
-        ↓
-Kafka Topics
-        ↓
-Kafka Consumer
-        ↓
-AWS S3 (RAW)
-        ↓
-AWS Glue (ETL)
-        ↓
-S3 Processed
-        ↓
-MongoDB Atlas (opcional)
-
-Requisitos:
-- Kafka levantado en localhost:9092
-- Topics creados:
-    - gold_csv
-    - gold_yfinance
-- Bucket S3 existente
-- Glue crawler y Glue job creados manualmente una vez
-
-Autor: Proyecto Final
-"""
-
 # ─────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────
@@ -465,95 +434,6 @@ def ingest_s3_data():
 
     return records
 
-def ingest_s3_data():
-
-    paginator = s3.get_paginator("list_objects_v2")
-
-    pages = paginator.paginate(
-        Bucket=BUCKET_NAME,
-        Prefix="gold_csv/"
-    )
-
-    records = []
-
-    total_files = 0
-
-    for page in pages:
-
-        if "Contents" not in page:
-            continue
-
-        for obj in page["Contents"]:
-
-            key = obj["Key"]
-
-            # Saltar carpetas
-            if key.endswith("/"):
-                continue
-
-            total_files += 1
-
-            print(f"[S3] Procesando: {key}")
-
-            try:
-
-                file_obj = s3.get_object(
-                    Bucket=BUCKET_NAME,
-                    Key=key
-                )
-
-                content = file_obj["Body"].read().decode("utf-8")
-
-                data = json.loads(content)
-
-                if "date;open;high;low;close;volume" in data:
-
-                    raw = data["date;open;high;low;close;volume"]
-
-                    values = raw.split(";")
-
-                    if len(values) != 6:
-                        print(f"[S3] Formato inválido: {key}")
-                        continue
-
-                    record = {
-                        "date": values[0],
-                        "open": float(values[1]),
-                        "high": float(values[2]),
-                        "low": float(values[3]),
-                        "close": float(values[4]),
-                        "volume": float(values[5]),
-                        "source": data.get("source"),
-                        "ingested_at": data.get("ingested_at")
-                    }
-
-                elif "date" in data:
-
-                    record = {
-                        "date": data.get("date"),
-                        "open": float(data.get("open", 0)),
-                        "high": float(data.get("high", 0)),
-                        "low": float(data.get("low", 0)),
-                        "close": float(data.get("close", 0)),
-                        "volume": float(data.get("volume", 0)),
-                        "source": data.get("source"),
-                        "ingested_at": data.get("ingested_at")
-                    }
-
-                else:
-                    print(f"[S3] Formato desconocido: {key}")
-                    continue
-
-                records.append(record)
-
-            except Exception as e:
-                print(f"[S3] Error procesando {key}: {e}")
-
-    print(f"\n[S3] Archivos procesados: {total_files}")
-    print(f"[S3] Registros preparados: {len(records)}")
-
-    return records
-
 def insert_data(cursor, cnx, records):
 
     print(f"\n[RDS] Insertando {len(records)} registros...")
@@ -672,10 +552,6 @@ def ingest_yfinance_to_mongo():
 
                 data = json.loads(content)
 
-                # =================================================
-                # NORMALIZAR NOMBRES DE COLUMNAS
-                # =================================================
-
                 record = {
 
                     "date": data.get("Date"),
@@ -749,11 +625,41 @@ def yfinance_to_mongo():
     # drop_mongo_collection()
 
     records = ingest_yfinance_to_mongo()
-    print(f"[DEBUG] records recibidos: {len(records)}")
 
     insert_to_mongo(records)
 
     print("[MONGO] Proceso completado")
+
+# ─────────────────────────────────────────────
+# GLUE JOB
+# ─────────────────────────────────────────────
+def run_glue_job():
+
+    print(f"\n[GLUE] Lanzando job '{GLUE_JOB}'...")
+
+    response = glue.start_job_run(JobName=GLUE_JOB)
+    run_id = response["JobRunId"]
+
+    print(f"[GLUE] JobRunId: {run_id}")
+
+    while True:
+
+        status = glue.get_job_run(
+            JobName=GLUE_JOB,
+            RunId=run_id
+        )["JobRun"]["JobRunState"]
+
+        print(f"[GLUE] Estado: {status}")
+
+        if status in ("SUCCEEDED", "FAILED", "STOPPED", "ERROR", "TIMEOUT"):
+            break
+
+        time.sleep(30)
+
+    if status == "SUCCEEDED":
+        print("[GLUE] Job completado correctamente")
+    else:
+        raise RuntimeError(f"[GLUE] Job terminó con estado: {status}")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -765,26 +671,19 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 1. PRODUCER
-    # publish_csv()
-    # publish_yfinance()
+    publish_csv()
+    publish_yfinance()
 
     # 2. CONSUMER -> S3
-    # run_consumer()
+    run_consumer()
 
     # 3. RDS
-    #csv_to_rds()
+    csv_to_rds()
 
-    # MONGODB
+    # 4. MONGODB
     yfinance_to_mongo()
 
-    # 3. GLUE CRAWLER
-    # run_glue_crawler()
-    # time.sleep(10)
-
-    # 4. GLUE ETL
-    # run_glue_job()
-
-    # 5. S3 → MONGODB
-    # upload_processed_to_mongodb()
+    # 5. GLUE ETL
+    run_glue_job()
 
     print("\n[INFO] PIPELINE COMPLETADO")
